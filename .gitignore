@@ -1,0 +1,29 @@
+.env
+.env.*
+!.env.example
+logs/*
+!logs/.gitkeep
+certs/*
+!certs/.gitkeep
+__pycache__/
+*.pyc
+*.swp
+
+# Additional secrets and local data
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.bak
+*.backup
+
+# Local IDE
+.vscode/
+.idea/
+.DS_Store

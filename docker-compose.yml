@@ -1,0 +1,103 @@
+name: homelab-airflow
+
+x-airflow-common: &airflow-common
+  image: handyman-airflow:3.1.8-keycloak
+  user: "${AIRFLOW_UID:-50000}:0"
+  env_file:
+    - .env
+  environment: &airflow-env
+    TZ: Europe/Moscow
+    AIRFLOW_HOME: /opt/airflow
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__PARALLELISM: "2"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+    AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: "1"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow_app:${AIRFLOW_DB_PASSWORD:?Run prepare.sh first}@pg3:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?Run prepare.sh first}
+    AIRFLOW__CORE__INTERNAL_API_SECRET_KEY: ${AIRFLOW_INTERNAL_API_SECRET_KEY:?Run prepare.sh first}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?Run prepare.sh first}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:?Run prepare.sh first}
+    AIRFLOW__API__BASE_URL: https://airflow.handyman.moscow
+    AIRFLOW__API__WORKERS: "1"
+    AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__KEYCLOAK_AUTH_MANAGER__SERVER_URL: ${KEYCLOAK_SERVER_URL:-https://keycloak.handyman.moscow}
+    AIRFLOW__KEYCLOAK_AUTH_MANAGER__REALM: ${KEYCLOAK_REALM:?Fill KEYCLOAK_REALM in .env}
+    AIRFLOW__KEYCLOAK_AUTH_MANAGER__CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-airflow}
+    AIRFLOW__KEYCLOAK_AUTH_MANAGER__CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:?Fill KEYCLOAK_CLIENT_SECRET in .env}
+    REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+    SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+  volumes: &airflow-volumes
+    - ./dags:/opt/airflow/dags:ro
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins:ro
+  restart: unless-stopped
+  networks:
+    - backend
+
+services:
+  airflow-init:
+    <<: *airflow-common
+    command: ["db", "migrate"]
+    restart: "no"
+
+  airflow-api-server:
+    <<: *airflow-common
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["api-server", "--proxy-headers"]
+    environment:
+      <<: *airflow-env
+      FORWARDED_ALLOW_IPS: "*"
+    expose:
+      - "8080"
+    networks:
+      - backend
+      - proxy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/public/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: ["scheduler"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: ["dag-processor"]
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: ["triggerer"]
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles: ["tools"]
+    restart: "no"
+    entrypoint: ["airflow"]
+    command: ["version"]
+    networks:
+      - backend
+      - proxy
+
+networks:
+  backend:
+    external: true
+    name: homelab-db
+  proxy:
+    external: true
+    name: outline-network
