@@ -1,199 +1,353 @@
-# Airflow 3 для handyman.moscow
+# Homelab Airflow — Apache Airflow 3.1.8 + Keycloak
 
-Локальный Apache Airflow **3.1.8**, **LocalExecutor**, без Celery, Redis и отдельных Worker.
+Локальный оркестратор Data Engineering Platform на HP-сервере (Ubuntu 24.04, Docker Compose). Используется **Apache Airflow 3.1.8**, исполнитель **LocalExecutor**, PostgreSQL **pg3** и существующая система авторизации **Keycloak**. Интерфейс доступен через общий Nginx по адресу **https://airflow.handyman.moscow**.
 
-Использует существующие компоненты HP-сервера:
+Назначение: разработка и тестирование DAG, расписаний, ETL/ELT-конвейеров, интеграционных задач и будущих сценариев управления Spark/Iceberg. Это **личная лаборатория**, а не отдельный production-кластер с Celery и распределёнными Worker.
 
-- **pg3** (PostgreSQL 15), БД `airflow`, доступ из Docker-сети `homelab-db` (`pg3:5432`);
-- **Keycloak** существующего Outline-стека (`keycloak.handyman.moscow`), один realm, новый OIDC-клиент `airflow`;
-- **homelab-nginx** и существующий локальный TLS CA (файл `outline_wiki/nginx/certs/rootCA.pem`);
-- интерфейс `https://airflow.handyman.moscow`.
+Связанные репозитории: [Outline / инфраструктура](https://github.com/glazole/outline_wiki), [Spark + Iceberg + JupyterHub](https://github.com/glazole/homelab-sparkice), [PostgreSQL + ClickHouse + Metabase](https://github.com/glazole/homelab-analytics-stack).
 
-## Структура
+## 1. Архитектура
 
-```text
-~/projects/homelab/
-├── postgres/                # работающий pg1 / pg2 / pg3
-├── outline_wiki/            # существующие Nginx + Keycloak + RustFS
-└── airflow/                 # этот проект
-    ├── docker-compose.yml
-    ├── Dockerfile
-    ├── .env.example
-    ├── prepare.sh
-    ├── start.sh
-    ├── stop.sh
-    ├── status.sh
-    ├── install-nginx.sh
-    ├── nginx/airflow.conf
-    ├── dags/homelab_smoke_test.py
-    ├── certs/               # локально копируется публичный rootCA сертификат
-    ├── logs/                # логи Airflow
-    └── plugins/
+| Компонент | Роль |
+|---|---|
+| Airflow API Server | Веб-интерфейс, REST API, авторизация через Keycloak |
+| Airflow Scheduler | Планирование и запуск DAG |
+| Airflow DAG Processor | Парсинг DAG-файлов |
+| Airflow Triggerer | Асинхронные триггеры для deferrable operators; определён в Compose |
+| Airflow Init | Одноразовая миграция БД `airflow db migrate` |
+| PostgreSQL pg3 | Уже существующая БД `airflow`, роль `airflow_app` |
+| Keycloak | Уже существующий realm и выделенный OIDC-клиент `airflow` |
+| Nginx | Уже существующий `homelab-nginx`, HTTPS |
+| LocalExecutor | Выполнение задач локально в среде Airflow, **без Celery, Redis и отдельных Celery Workers** |
+
+```mermaid
+flowchart LR
+  U[Браузер / Tailscale] --> N[homelab-nginx HTTPS]
+  N --> API[Airflow API Server]
+  API --> KC[Keycloak OIDC]
+  API --> PG[(PostgreSQL pg3 / airflow)]
+  SC[Scheduler / LocalExecutor] --> PG
+  DP[DAG Processor] --> PG
+  TR[Triggerer] --> PG
+  SC --> DAG[DAG task]
 ```
 
-## 1. Разместить проект
+Две **внешние** Docker-сети:
 
-Распаковать готовый архив в `~/projects/homelab/`:
+- `homelab-db` — Airflow ↔ `pg3:5432`;
+- `outline-network` — API Server и CLI ↔ существующие Nginx/Keycloak.
+
+Port `8080` не публикуется напрямую на HP-сервере; доступ через Nginx. Базовые pg1–pg3, Keycloak, Outline и RustFS не поднимаются повторно данным Compose.
+
+**Важное уточнение о Triggerer:** сервис `airflow-triggerer` **описан** в `docker-compose.yml` и реально запускался на HP, но текущие `start.sh` и `stop.sh` перечисляют только API Server, Scheduler и DAG Processor. Поэтому запуск/остановку Triggerer следует выполнять **отдельно**, если нужен именно он. Для стандартных LocalExecutor DAG он необязателен.
+
+## 2. Структура
+
+```text
+airflow/
+├── README.md
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+├── .gitignore
+├── .dockerignore
+├── prepare.sh
+├── start.sh
+├── stop.sh
+├── status.sh
+├── install-nginx.sh
+├── nginx/airflow.conf
+├── dags/homelab_smoke_test.py
+├── plugins/
+├── logs/
+└── certs/
+```
+
+Пути `dags/` и `plugins/` примонтированы **read-only**, `logs/` — для записи. Локальные `.env`, сертификаты и логи не должны попадать в Git.
+
+## 3. Зависимости и предварительная проверка
+
+Нужны: Docker Engine + Compose v2, Python 3 на хосте, PostgreSQL `pg3` с БД `airflow`, работающий Keycloak, доверенный корневой CA из проекта Outline и общий Nginx. Сертификат должен покрывать `airflow.handyman.moscow`. DNS работает через Tailscale/dnsmasq в существующем Homelab.
+
+```bash
+docker compose version
+docker network inspect homelab-db >/dev/null
+docker network inspect outline-network >/dev/null
+docker inspect pg3 --format '{{.State.Health.Status}}'
+docker ps --format 'table {{.Names}}\t{{.Status}}'
+```
+
+Код и скрипты рассчитаны на локальный путь **`~/projects/homelab/airflow`**, расположенный рядом с `outline_wiki`. Клонируйте репозиторий с этим именем каталога:
 
 ```bash
 cd ~/projects/homelab
-# скопируйте сюда homelab-airflow.tar.gz
-# далее:
-tar -xzf homelab-airflow.tar.gz
+git clone git@github.com:glazole/homelab-airflow.git airflow
 cd airflow
 chmod +x ./*.sh
 ```
 
-**До запуска** проверь, что pg3 здоровый, Outline/Keycloak и homelab-nginx работают и что в Nginx SSL-сертификат покрывает `airflow.handyman.moscow` (wildcard или SAN).
+Если каталог уже существует, **не клонируйте поверх него**: перед обновлением выполнить `git status`.
+
+## 4. Первый запуск
+
+### Шаг 1. Подготовить .env, pg3 и сертификат
 
 ```bash
-docker ps --format 'table {{.Names}}\t{{.Status}}'
-docker network ls | grep -E 'homelab-db|outline-network'
-```
-
-Если Outline не запущен, запусти его штатным Compose из `../outline_wiki` перед Airflow. Запуск и остановка Airflow **не затрагивают** Outline, Keycloak, pg1 или pg2.
-
-## 2. Подготовить pg3 и локальные секреты
-
-```bash
+cd ~/projects/homelab/airflow
 ./prepare.sh
 ```
 
 Скрипт:
 
-1. Создаёт `.env` с **новыми секретами**, если файл ещё не существует;
-2. копирует **публичный корневой сертификат**, не ключ (!) из существующего Outline;
-3. создаёт/обновляет прикладную роль PostgreSQL `airflow_app` с доступом к существующей БД `airflow` в **pg3**;
-4. не выполняет миграций схемы БД (это сделает `start.sh`).
+1. создаёт `.env` из `.env.example` и генерирует пароли / ключи (если файла нет);
+2. копирует **только публичный CA** `../outline_wiki/nginx/certs/rootCA.pem` в `certs/homelab-rootCA.crt`;
+3. подключается к `pg3`, создаёт/обновляет роль `airflow_app`, назначает её владельцем БД `airflow` и выдаёт необходимые права на схему `public`;
+4. не выполняет миграцию Airflow (она запускается позже).
 
-При повторном запуске `.env` **не перезаписывается**; пароль роли в `pg3` приводится в соответствие с уже существующим `.env`. Права на `.env` — `600`. Не публиковать файл, секреты из Docker и rootCA private key в Git.
+Существующий `.env` не перезаписывается. **Повторный `prepare.sh` обновляет пароль PostgreSQL-роли `airflow_app` по текущему .env**, поэтому не меняйте значение секрета наугад.
 
-## 3. Создать OIDC-клиент airflow в существующем Keycloak
+В `.env` должны быть:
 
-Открой существующую консоль Keycloak: `https://keycloak.handyman.moscow`.
+| Переменная | Назначение |
+|---|---|
+| `AIRFLOW_UID` | UID пользователя файловой системы контейнера |
+| `AIRFLOW_DB_PASSWORD` | Пароль роли `airflow_app` в pg3 |
+| `AIRFLOW_FERNET_KEY` | Шифрование Airflow Connections / Variables |
+| `AIRFLOW_API_SECRET_KEY`, `AIRFLOW_INTERNAL_API_SECRET_KEY`, `AIRFLOW_JWT_SECRET` | Секреты API и внутреннего взаимодействия |
+| `KEYCLOAK_SERVER_URL` | `https://keycloak.handyman.moscow` |
+| `KEYCLOAK_REALM` | Имя **существующего** realm |
+| `KEYCLOAK_CLIENT_ID` | `airflow` |
+| `KEYCLOAK_CLIENT_SECRET` | Секрет выделенного клиента |
 
-**Используй уже существующий realm Outline**. Realm не создавай, существующих пользователей и клиентов не меняй.
+Не отправляйте содержимое `.env` или логины/пароли в чат, Git или скриншоты.
 
-Создай новый клиент:
+### Шаг 2. OIDC-клиент в Keycloak
 
-| Поле Keycloak | Значение |
+Администрирование: **https://keycloak.handyman.moscow**. Создать **новый** клиент в уже работающем realm; остальных клиентов не менять.
+
+| Keycloak | Значение |
 |---|---|
 | Client ID | `airflow` |
-| Client type | `OpenID Connect` |
-| Client authentication | `ON` |
-| Authorization | `ON` (нужен Keycloak Auth Manager) |
-| Standard flow | `ON` |
-| Implicit flow | `OFF` |
-| Root URL | `https://airflow.handyman.moscow` |
-| Home URL | `https://airflow.handyman.moscow` |
+| Protocol | OpenID Connect |
+| Client authentication | ON |
+| Authorization | ON — необходим Keycloak Auth Manager |
+| Standard flow | ON |
+| Implicit flow | OFF |
+| Root/Home URL | `https://airflow.handyman.moscow` |
 | Valid redirect URIs | `https://airflow.handyman.moscow/*` |
-| Valid post logout redirect URIs | `https://airflow.handyman.moscow/*` |
+| Valid post-logout redirect URIs | `https://airflow.handyman.moscow/*` |
 | Web origins | `https://airflow.handyman.moscow` |
 
-Публичное имя Keycloak должно быть `https://keycloak.handyman.moscow` и доступно **изнутри контейнера API** через Nginx/Docker DNS.
-
-На вкладке **Credentials** получи Client Secret. В `.env` замени:
+Из Client Credentials скопировать secret в локальный `.env`:
 
 ```ini
-KEYCLOAK_REALM=<точное_имя_существующего_realm>
-KEYCLOAK_CLIENT_SECRET=<client_secret_клиента_airflow>
+KEYCLOAK_REALM=<existing-realm>
+KEYCLOAK_CLIENT_SECRET=<new-client-secret>
 ```
 
-Не меняй автоматически сгенерированные `AIRFLOW_*_SECRET`, DB_PASSWORD или FERNET_KEY после инициализации. Не копируй секреты в чат.
+Непосредственно из контейнера Airflow должен быть доступен Keycloak по публичному HTTPS-имени, а CA — доверенным. Нельзя «исправлять» OIDC, отключая TLS-проверку.
 
-Документация Apache: https://airflow.apache.org/docs/apache-airflow-providers-keycloak/stable/auth-manager/manage/login.html
-
-## 4. Запустить Airflow
+### Шаг 3. Собрать образ и выполнить миграцию
 
 ```bash
+cd ~/projects/homelab/airflow
+docker compose config --quiet
 ./start.sh
 ```
 
-Последовательность: проверка pg3, Docker-сетей, OIDC env → сборка образа (если отсутствует) → `airflow db migrate` → запуск **API Server + Scheduler + DAG Processor**.
+Скрипт проверяет `.env`, CA, доступность сетей и состояние `pg3=healthy`, собирает образ `handyman-airflow:3.1.8-keycloak` при отсутствии, затем выполняет:
 
-Загрузка образа и сборка на первом запуске могут занять время. Рабочих Celery Worker и Redis здесь нет. Triggerer не запускается (для будущих deferrable operators можно добавить отдельно).
+```bash
+docker compose run --rm airflow-init
+docker compose up -d airflow-api-server airflow-scheduler airflow-dag-processor
+```
 
-Просмотр контейнеров и логов:
+Миграцию БД делает контейнер `airflow-init`. **На первом запуске это может занять время.**
+
+Проверка:
 
 ```bash
 ./status.sh
-docker compose logs -f airflow-api-server
+docker compose ps
+docker compose logs --tail=100 airflow-api-server
 docker compose logs --tail=100 airflow-scheduler airflow-dag-processor
 ```
 
-Если изменён Dockerfile, принудительно пересобери:
+Если изменился `Dockerfile`, перед запуском можно пересобрать образ:
 
 ```bash
 docker compose build --pull
 ./start.sh
 ```
 
-## 5. Подключить адрес airflow.handyman.moscow к существующему Nginx
+#### Triggerer (по желанию)
+
+В реальном развёртывании на HP Triggerer запускался. Однако `start.sh` и `stop.sh` пока не управляют этим сервисом. Для использования deferrable operators:
 
 ```bash
-./install-nginx.sh
+docker compose up -d airflow-triggerer
+docker compose logs --tail=80 airflow-triggerer
+
+# Остановить отдельно, когда он больше не нужен
+docker compose stop airflow-triggerer
 ```
 
-Скрипт копирует **только** `nginx/airflow.conf` в `../outline_wiki/nginx/conf.d/airflow.conf`, при необходимости создаёт backup старого файла, выполняет `nginx -t` и reload **работающего** `homelab-nginx`.
+### Шаг 4. Настроить Nginx и DNS
 
-Не добавляется второй Nginx, не меняются server blocks Outline/Keycloak/RustFS. Необходимые Docker DNS aliases и общая сеть `outline-network` уже предусмотрены в существующем Outline-стеке.
-
-Проверки:
+Существующий Nginx должен обслуживать `airflow.handyman.moscow` и быть подключён к `outline-network`. DNS в текущем стенде разрешает поддомены на Tailscale IP HP-сервера.
 
 ```bash
+cd ~/projects/homelab/airflow
+./install-nginx.sh
+
 docker exec homelab-nginx nginx -t
 docker exec homelab-nginx getent hosts airflow-api-server
 docker exec airflow-api-server getent hosts pg3
 curl -k -I https://airflow.handyman.moscow/
 ```
 
-`curl -k` — **только диагностическая** проверка, если сертификат выпущен локальным CA, которому система пока не доверяет. Для браузера нужно импортировать корневой CA или использовать публичный сертификат. Не отключай TLS-проверку в Airflow/Keycloak.
+`install-nginx.sh` переносит **один** серверный блок `nginx/airflow.conf` в `../outline_wiki/nginx/conf.d/airflow.conf`, проверяет конфигурацию и перезагружает существующий Nginx. При повторной установке умеет создать `.bak` предыдущего файла. Проверьте отсутствие других блоков для этого hostname.
 
-Если получен 502, сначала проверь статус и логи API Server и разрешение `airflow-api-server` из Nginx.
+`curl -k` допустим **только как диагностический тест** при частном сертификате; для штатной работы нужно доверие к собственному CA.
 
-## 6. Настроить авторизацию (не пропускать)
+### Шаг 5. Создать разрешения Keycloak Auth Manager
 
-**Вход в Keycloak и права на чтение DAG — разные вещи.** Apache Keycloak Auth Manager требует разрешений в client Authorization.
+**Аутентификация и авторизация различаются.** Успешный вход через Keycloak сам по себе не означает наличие прав просмотра DAG.
 
-После запуска, когда клиент `airflow` создан, выполни (будет запрос пароля администратора Keycloak):
-
-```bash
-# Диагностика: сухой прогон настройки ресурсов / ролей
-# Учётная запись admin может относиться к realm master.
-docker compose run --rm airflow-cli keycloak-auth-manager create-all --username admin --dry-run
-
-# Только после успешной проверки — создание разрешений
-docker compose run --rm airflow-cli keycloak-auth-manager create-all --username admin
-```
-
-Если администратор Keycloak находится в другом realm, укажи `--user-realm`. Команда меняет **авторизационные ресурсы клиента airflow**; если этого не сделать, возможны успешный вход в Keycloak и пустой/недоступный интерфейс Airflow.
-
-После создания разрешений **назначь своему пользователю** подходящую роль клиента (для личного стенда — Admin по доступной модели клиента). Наличие роли в Keycloak не следует путать с системной ролью realm-admin. Не включай разрешения для всех пользователей по умолчанию.
-
-Документация: https://airflow.apache.org/docs/apache-airflow-providers-keycloak/stable/auth-manager/manage/permissions.html
-
-## 7. Проверить end-to-end
-
-В браузере открой **https://airflow.handyman.moscow**. После входа через существующий Keycloak найди DAG `homelab_smoke_test`. Он **без расписания** (`schedule=None`), запускается вручную, выводит строку `Airflow 3 LocalExecutor: task executed successfully`.
-
-Этот smoke test проверит сразу пять вещей: загрузку DAG, `LocalExecutor`, связность API Server / Scheduler, запись результатов в pg3 и просмотр логов в веб-интерфейсе.
-
-## 8. Остановка и безопасность
+Согласно конфигурации используется `airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager`. Его авторизационные сущности нужно создать в соответствующем клиенте:
 
 ```bash
-./stop.sh     # останавливает ТОЛЬКО три фоновых процесса Airflow
-./start.sh    # повторный запуск, БД и логи сохраняются
+cd ~/projects/homelab/airflow
+
+# Сначала dry-run
+docker compose run --rm airflow-cli \
+  keycloak-auth-manager create-all --username admin --dry-run
+
+# Затем применение
+docker compose run --rm airflow-cli \
+  keycloak-auth-manager create-all --username admin
 ```
 
-- Для начального стенда **нет** внешней публикации порта `8080`; путь снаружи идёт через существующий Nginx.
-- `pg3` уже слушает только `127.0.0.1:55434` на хосте; контейнеры взаимодействуют по `pg3:5432`.
-- `.env` содержит секреты и игнорируется Git; настройки ролей и ключей не публиковать.
-- `FORWARDED_ALLOW_IPS="*"` подходит только если API Server изолирован за доверенным Nginx и прочие участники Docker-сетей доверенные. Для более строгой изоляции зафиксировать IP прокси.
-- LocalExecutor исполняет код DAG с правами процесса Scheduler. Не принимать неизвестные DAG и не предоставлять загрузку кода посторонним.
-- Для восстановления сохраняй **pg3**, `.env`, DAG и `logs`; не меняй Fernet key без процедуры ротации.
+Команда запрашивает доступ администратора Keycloak. Если он находится не в стандартном realm, потребуется параметр `--user-realm`. После создания ресурсов назначить своему пользователю **подходящую роль клиента**. Не предоставлять административный доступ всем пользователям.
 
-> Apache предупреждает, что Keycloak Auth Manager ещё является экспериментальным. Эта схема подходит для личного стенда, но перед публичным production-использованием необходимы проверка версий, TLS, политики доступа и резервное копирование.
+Официальная документация: [Airflow Keycloak Auth Manager](https://airflow.apache.org/docs/apache-airflow-providers-keycloak/stable/auth-manager/manage/login.html).
 
-## 9. Позже: Sparkice
+### Шаг 6. Проверить DAG
 
-У Sparkice будет отдельный Compose и собственный Git-репозиторий. Airflow не требует развертывания Spark прямо сейчас. Когда Sparkice будет готов, используем общую сеть и S3 (RustFS), добавим DAG запуска Spark-задания через подходящий оператор/контракт без развёртывания новых S3 и Keycloak.
+Перейти в **https://airflow.handyman.moscow**, авторизоваться через Keycloak, найти `homelab_smoke_test` и запустить его **вручную** — у него `schedule=None`.
+
+Проверка должна показать успешное выполнение LocalExecutor task. Логи теста содержат:
+
+```text
+Airflow 3 LocalExecutor: task executed successfully
+```
+
+Это проверяет чтение DAG, работу Scheduler/LocalExecutor, запись состояния в pg3 и отображение логов через API Server. Наличие сервиса Triggerer не требуется для данного smoke test.
+
+## 5. Повседневные операции
+
+**Запустить базовые компоненты**:
+
+```bash
+cd ~/projects/homelab/airflow
+./start.sh
+```
+
+Следует учитывать, что `start.sh` каждый раз выполняет `airflow db migrate` через `airflow-init`; для обычного рестарта без обновления схемы можно ограничиться:
+
+```bash
+docker compose up -d \
+  airflow-api-server airflow-scheduler airflow-dag-processor
+```
+
+**Запустить Triggerer**:
+
+```bash
+docker compose up -d airflow-triggerer
+```
+
+**Статус и логи**:
+
+```bash
+./status.sh
+docker compose ps
+docker compose logs --tail=100 airflow-api-server airflow-scheduler airflow-dag-processor airflow-triggerer
+```
+
+**Остановить Airflow**:
+
+```bash
+./stop.sh
+docker compose stop airflow-triggerer
+```
+
+В текущем коде `stop.sh` останавливает **только API Server, Scheduler и DAG Processor**. Команда выше дополнительно завершает Triggerer. Не останавливайте `pg3`, пока он используется Airflow или другими сервисами.
+
+**Обновить код DAG**: сохранить файл в `dags/` и дождаться обработки DAG Processor; папка подключена как volume. Не требуется пересборка образа только из-за Python DAG.
+
+**Пересобрать образ** после изменения Dockerfile/requirements:
+
+```bash
+docker compose build --pull
+docker compose up -d --force-recreate \
+  airflow-api-server airflow-scheduler airflow-dag-processor
+```
+
+Проверять совместимость установленных provider-пакетов с Airflow 3.1.8; на практике неконтролируемые обновления зависимостей могут нарушить сборку.
+
+## 6. Ограничения вычислений
+
+`docker-compose.yml` выставляет консервативные параметры:
+
+| Параметр | Значение |
+|---|---|
+| Executor | `LocalExecutor` |
+| Parallelism | `2` |
+| Max active tasks per DAG | `2` |
+| Max active runs per DAG | `1` |
+| Scheduler parsing processes | `1` |
+| API Workers | `1` |
+
+Этот режим подходит для личных DAG и тестовых пайплайнов. Ресурсоёмкие расчёты целесообразно выносить в Spark, а Airflow использовать для оркестрации, но готовую интеграцию Spark-оператора данный проект **не заявляет**.
+
+Для наблюдения за ресурсами:
+
+```bash
+free -h
+docker stats --no-stream \
+  --format 'table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}'
+```
+
+## 7. Распространённые неполадки
+
+| Симптом | Что проверить |
+|---|---|
+| `pg3 не healthy` | Контейнер PostgreSQL, БД `airflow`, сеть `homelab-db` |
+| `Нет .env / KEYCLOAK_REALM` | `./prepare.sh` и клиент `airflow` в существующем Keycloak |
+| Ошибка OAuth/SSL | Адрес realm, redirect URI, trust chain CA в контейнере |
+| Успешный логин, пустой список DAG или 403 | Роли и Authorization resources в Keycloak Auth Manager |
+| HTTP 502 от Nginx | `docker compose ps`, `airflow-api-server`, `nginx -t`, Docker DNS |
+| DAG не появляется | Файл в `dags/`, логи `airflow-dag-processor` |
+| Задание не запускается | Логи `airflow-scheduler`, ограничения параллельности |
+| Triggerer не виден в `docker compose ps` | Текущий `start.sh` его не поднимает — запускать отдельно |
+| Ошибка миграции БД | Логи `airflow-init`, PostgreSQL-доступ, версии Airflow/providers |
+
+## 8. Безопасность и сохранность данных
+
+- `.env` хранит доступ к pg3, Keycloak и ключи шифрования. Права на файл должны быть ограничены; **не коммитить**.
+- `Airflow Fernet Key` используется для зашифрованных значений. Его смена без процедуры ротации может сделать ранее сохранённые Connections/Variables нечитаемыми.
+- `LocalExecutor` исполняет код DAG с правами локальных процессов Airflow. Не допускать загрузки неподконтрольных DAG.
+- `FORWARDED_ALLOW_IPS="*"` допустим лишь при доверенном окружении за Nginx; не открывать API Server напрямую в Интернет.
+- Сохранять БД `pg3.airflow`, `.env`, `dags/`, `logs/` и необходимые конфигурации; **Git-репозитория недостаточно** для восстановления.
+- Не использовать `docker compose down -v` как обычную остановку; не менять Keycloak realm/клиента и секреты без понимания влияния на SSO.
+- Keycloak Auth Manager требует внимательной проверки совместимости версий и полномочий перед доступом внешних пользователей.
+
+## 9. Что подтверждено в Homelab
+
+К октябрю 2026 на HP-сервере работали контейнеры **Airflow API Server, Scheduler, DAG Processor и Triggerer**; использовались PostgreSQL pg3 и HTTPS через существующий Nginx. Описание четырёх контейнеров основано на фактическом выводе `docker ps`, а не только на проектном Compose.
+
+README различает **наблюдавшуюся конфигурацию** и то, что делает текущий `start.sh`: последний запускает только три основных сервиса. Повторная проверка E2E smoke test, восстановление из резервной копии и обновление провайдеров должны выполняться отдельно.
+
+---
+
+Другие компоненты платформы: [outline_wiki](https://github.com/glazole/outline_wiki) · [homelab-sparkice](https://github.com/glazole/homelab-sparkice) · [homelab-analytics-stack](https://github.com/glazole/homelab-analytics-stack).
