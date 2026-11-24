@@ -8,6 +8,7 @@ certs/*
 __pycache__/
 *.pyc
 *.swp
+dags/*
 
 # Additional secrets and local data
 secrets/

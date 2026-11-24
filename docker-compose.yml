@@ -12,8 +12,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    AIRFLOW__CORE__PARALLELISM: "2"
-    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+    AIRFLOW__CORE__PARALLELISM: "6"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "4"
     AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: "1"
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow_app:${AIRFLOW_DB_PASSWORD:?Run prepare.sh first}@pg3:5432/airflow
@@ -29,8 +29,31 @@ x-airflow-common: &airflow-common
     AIRFLOW__KEYCLOAK_AUTH_MANAGER__REALM: ${KEYCLOAK_REALM:?Fill KEYCLOAK_REALM in .env}
     AIRFLOW__KEYCLOAK_AUTH_MANAGER__CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-airflow}
     AIRFLOW__KEYCLOAK_AUTH_MANAGER__CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:?Fill KEYCLOAK_CLIENT_SECRET in .env}
+    AIRFLOW__API__EXPOSE_CONFIG: "non-sensitive-only"
+    AIRFLOW__CORE__TEST_CONNECTION: "Enabled"
     REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
     SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+
+        # --- Airflow remote task logs to S3 (RustFS) ---
+    AIRFLOW__LOGGING__REMOTE_LOGGING: "True"
+    AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: "rustfs_s3_logs"
+    AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: "s3://home-airflow/airflow-logs"
+    AIRFLOW__LOGGING__ENCRYPT_S3_LOGS: "False"
+
+    # Пока сохраняем локальные логи для подстраховки
+    AIRFLOW__LOGGING__DELETE_LOCAL_LOGS: "False"
+
+    # --- RustFS S3 connection (Docker internal network) ---
+    AIRFLOW_CONN_RUSTFS_S3_LOGS: >-
+      {"conn_type":"aws",
+       "login":"${RUSTFS_ACCESS_KEY}",
+       "password":"${RUSTFS_SECRET_KEY}",
+       "extra":{
+         "endpoint_url":"http://rustfs:9000",
+         "region_name":"us-east-1",
+         "config_kwargs":{"s3":{"addressing_style":"path"}}
+       }}
+
   volumes: &airflow-volumes
     - ./dags:/opt/airflow/dags:ro
     - ./logs:/opt/airflow/logs
@@ -38,6 +61,7 @@ x-airflow-common: &airflow-common
   restart: unless-stopped
   networks:
     - backend
+    - proxy
 
 services:
   airflow-init:
